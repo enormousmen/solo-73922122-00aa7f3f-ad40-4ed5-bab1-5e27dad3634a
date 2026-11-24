@@ -7,10 +7,16 @@ services:
       # 两组由服务独占管理的 cpu.max（此处用普通文件模拟 cgroup v2）
       GROUP_A_CPU_MAX: /cgroup/groupA/cpu.max
       GROUP_B_CPU_MAX: /cgroup/groupB/cpu.max
+      # cpu.stat 默认取 cpu.max 同目录；这里显式写出便于替换为可编辑样例
+      GROUP_A_CPU_STAT: /cgroup/groupA/cpu.stat
+      GROUP_B_CPU_STAT: /cgroup/groupB/cpu.stat
       STATE_DIR: /state
       MIN_QUOTA: "20000"
+      # 限速统计后台采样间隔（秒）
+      CPU_STAT_SAMPLE_INTERVAL: "${CPU_STAT_SAMPLE_INTERVAL:-1.0}"
       # 演示用：置 1 后，服务在“让出方降额后、接收方升额前”模拟崩溃退出
       CRASH_AFTER_DONOR_WRITE: "${CRASH_AFTER_DONOR_WRITE:-0}"
     volumes:
+      # cgroup 目录以可写方式挂载：cpu.max 供划转写，cpu.stat 为可修改样例
       - ./cgroup:/cgroup
       - ./state:/state

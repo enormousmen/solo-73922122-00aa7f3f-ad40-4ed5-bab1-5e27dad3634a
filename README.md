@@ -30,10 +30,11 @@ app/
   cgroups.py   # cpu.max 解析/读写（写后 fsync）
   journal.py   # 转移日志（WAL）与原子写 JSON
   service.py   # 核心：转移、失败回退、启动恢复、不变式
+  throttling.py# cpu.stat 后台采样、按配额档位分档的限速统计
   main.py      # FastAPI 入口与依赖装配
-cgroup/        # 普通文件模拟的两组 cpu.max（初始 100000/50000，period 100000）
+cgroup/        # 普通文件模拟的两组 cpu.max / cpu.stat（初始 100000/50000，period 100000）
 state/         # 运行期状态：transfer_journal.json、last_result.json、service.lock
-tests/         # pytest：不变式、失败回退、崩溃恢复、API
+tests/         # pytest：不变式、失败回退、崩溃恢复、API、限速统计
 examples/demo.sh  # 端到端演示（docker / local 两种模式）
 ```
 
@@ -48,6 +49,8 @@ docker compose up -d --build
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `GROUP_A_CPU_MAX` / `GROUP_B_CPU_MAX` | `/cgroup/groupA/cpu.max` … | 两组 cpu.max 路径 |
+| `GROUP_A_CPU_STAT` / `GROUP_B_CPU_STAT` | 与 cpu.max 同目录的 `cpu.stat` | 两组 cpu.stat 路径 |
+| `CPU_STAT_SAMPLE_INTERVAL` | `1.0` | 限速统计后台采样间隔（秒） |
 | `STATE_DIR` | `/state` | 日志与结果目录 |
 | `MIN_QUOTA` | `20000` | 任一组 quota 下限 |
 | `CRASH_AFTER_DONOR_WRITE` | `0` | 演示用：置 `1` 模拟“让出方降额后进程崩溃” |
@@ -73,6 +76,60 @@ curl http://127.0.0.1:8000/status
 错误码：`400` 请求非法（未知组名、低于下限、period 不一致、quota 为 max 等）；
 `422` 参数校验失败；`503` 启动恢复未完成；`500` 写文件失败（已回退）。
 
+## 限速统计（按执行器组）
+
+构建变慢时，值班员可以按执行器组查询 cgroup 的限速情况：
+
+```bash
+curl http://127.0.0.1:8000/throttling/groupA
+curl http://127.0.0.1:8000/throttling          # 两组一起
+```
+
+启动后也可在 <http://127.0.0.1:8000/docs> 直接调用 `/throttling` 与
+`/throttling/{group}`。
+
+```jsonc
+{
+  "group": "groupA",
+  "started_at": "2026-11-24T06:47:42+00:00",   // 本次启动时间
+  "samples": 215,                               // 本次启动成功采样次数
+  "last_sample_at": "2026-11-24T06:51:16+00:00",
+  "buckets": [                                  // 按采样当时的 cpu.max 配额/周期分档
+    {"quota": "100000", "period": 100000,
+     "nr_periods": 850, "nr_throttled": 85, "throttled_ratio": 0.1},
+    {"quota": "120000", "period": 100000,
+     "nr_periods": 50, "nr_throttled": 5, "throttled_ratio": 0.1}
+  ],
+  "unattributable": {                           // 采样窗口内本组 cpu.max 被写过的周期
+    "nr_periods": 1000, "nr_throttled": 200,
+    "throttled_ratio": 0.2,
+    "reasons": ["write_overlap"]                // write_overlap / cpu_max_unreadable
+  },
+  "totals": {"nr_periods": 1900, "nr_throttled": 290, "throttled_ratio": 0.15}
+}
+```
+
+统计语义：
+
+- **后台采样**：每组一个采样线程，每秒尝试读取一次 cpu.stat；只关心
+  `nr_periods` 与 `nr_throttled`，用相邻两次成功读数的增量累计周期数与
+  限速周期数，并按**当时**的 `cpu.max` 配额与周期分档。
+- **占比**：每档、无法归属部分与总计都给出 `throttled_ratio =
+  nr_throttled / nr_periods`；周期数为 0 时该字段整体省略（不写 `null`）。
+- **计数器回退**：任一次读数里 `nr_periods` 或 `nr_throttled` 比上次小，
+  整段差值舍弃，并从这次读数重新起算。
+- **写入重叠**：归属窗口为“上次采样开始 → 本次采样结束”。只要本组的
+  `cpu.max` 在窗口内被写过（含把配额写回原值的写入），这段周期就单列为
+  `unattributable`，不进入任何档位；只有另一组写入时，本组照常分档。
+- **仅本次启动**：汇总只保存在内存里，进程重启即从零开始；不读写
+  `state/` 下的文件，也不与重启前的数据合并。
+- **不影响划转**：采样只读 cpu.stat / cpu.max，不持有划转服务的主锁，
+  读取变慢或卡住时划转、恢复与查询接口都照常工作。
+
+`cgroup/groupA/cpu.stat`、`cgroup/groupB/cpu.stat` 是可随意编辑的样例文件，
+Compose 已把整个 `cgroup/` 目录挂载进容器；改文件内容模拟计数器变化，
+下一次采样（≤1 秒）即可在 `/throttling` 看到增量。
+
 ## 演示（让出方降额后进程退出 → 重启恢复）
 
 ```bash
@@ -87,7 +144,9 @@ examples/demo.sh docker   # 或 examples/demo.sh local（本机直接跑 uvicorn
    现场为 `groupB=20000`（已降）、`groupA=120000`（未升）、日志 `in_progress`；
 4. 正常重启：启动恢复**回退**未登记成功的转移，`groupB` 恢复为 `30000`，
    `/status` 显示 `rolled_back`；
-5. 下限校验：让出 15000 使 groupB 低于下限 20000，被 400 拒绝。
+5. 下限校验：让出 15000 使 groupB 低于下限 20000，被 400 拒绝；
+6. 限速统计：修改 `cgroup/*/cpu.stat` 的计数后，`/throttling/<组>` 出现
+   按配额档累计的周期数与限速占比，划转窗口内的增量归入 `unattributable`。
 
 ## 测试
 
@@ -98,6 +157,9 @@ pytest
 
 20 个用例覆盖：总额不变式（转移与回退全程逐次校验）、下限边界、写失败回退、
 崩溃后重启回退、已登记保留、恢复失败持续拒绝、结果持久化、独占锁、API 各端点。
+另有 20 个限速统计用例（`tests/test_throttling.py`）：cpu.stat 解析、增量分档、
+周期占比、计数器回退、写入重叠归属、仅本次启动、读取失败容错、慢读取不阻塞
+划转、`/throttling` API。
 
 ## 设计要点
 
@@ -107,6 +169,9 @@ pytest
 - **先降后升**：转移先写让出方；回退按 delta 排序先写降额组，
   保证任意中间时刻总额不超过转移前总额。
 - **最近一次处理结果**持久化在 `state/last_result.json`，重启后仍可查询。
+- **限速统计与划转解耦**：服务每次写 cpu.max 都记录写入窗口（单调时钟起止），
+  采样线程只用这份窗口日志做区间重叠判断，和划转共用同一把 `WriteLog` 锁；
+  采样本身不持转移主锁、不写任何状态文件，所以 cpu.stat 慢不会影响划转。
 
 ## 已知限制 / 未完成
 
@@ -115,5 +180,10 @@ pytest
 - 登记（`registered`）写盘失败的极端情况下，转移已生效但未登记，
   按规则将在下次重启时被回退（与“未登记成功即回退”语义一致）。
 - 单实例部署：flock 防止同机多实例，但不支持跨机并发管理同一组文件。
-- 本仓库用普通文件模拟 cpu.max；接入真实 cgroup 时只需把
-  `GROUP_*_CPU_MAX` 指向 `/sys/fs/cgroup/...` 并保证容器有写权限。
+- 本仓库用普通文件模拟 cpu.max / cpu.stat；接入真实 cgroup 时只需把
+  `GROUP_*_CPU_MAX` / `GROUP_*_CPU_STAT` 指向 `/sys/fs/cgroup/...`
+  并保证容器有读写权限。
+- 限速统计只统计本服务启动后的采样窗口，第一次采样仅建立基线（不计增量）；
+  采样间隔内 `cpu.stat` 若被外部重置/回退，该段差值被丢弃。
+- 统计不区分“本服务写入”与“外部直接改文件”的写入；外部绕过服务改
+  `cpu.max` 不会被记入写入窗口，那段时间的周期仍会按读到的配额分档。

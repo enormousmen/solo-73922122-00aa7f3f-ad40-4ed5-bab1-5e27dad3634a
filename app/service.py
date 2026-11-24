@@ -24,6 +24,7 @@ from typing import Callable
 
 from .cgroups import CpuMax, CpuMaxError, read_cpu_max, write_cpu_max
 from .journal import STATE_IN_PROGRESS, STATE_REGISTERED, Journal, atomic_write_json
+from .throttling import WriteLog
 
 
 class TransferError(Exception):
@@ -51,6 +52,7 @@ class TransferService:
         state_dir: Path,
         min_quota: int,
         crash_hook: Callable[[str], None] | None = None,
+        write_log: WriteLog | None = None,
     ):
         if len(group_paths) != 2:
             raise ValueError("必须且只能管理两组 cpu.max")
@@ -63,6 +65,8 @@ class TransferService:
         self._lock = threading.Lock()
         # crash_hook：演示/测试用，模拟“让出方降额后进程崩溃”。生产为 None。
         self._crash_hook = crash_hook
+        # 记录本服务对每组 cpu.max 的写入窗口，供限速统计判断归属。
+        self.write_log = write_log or WriteLog()
         self.recovered = False
         self.last_result: dict | None = self._load_json(self._last_result_path)
         self._lock_fd: int | None = self._acquire_exclusive_lock()
@@ -193,10 +197,10 @@ class TransferService:
 
             try:
                 # 先降（让出方）后升（接收方）：任意时刻两组之和都不超过转移前总额
-                write_cpu_max(self.group_paths[donor], post[donor])
+                self._write(donor, post[donor])
                 if self._crash_hook is not None:
                     self._crash_hook("after_donor_write")
-                write_cpu_max(self.group_paths[receiver], post[receiver])
+                self._write(receiver, post[receiver])
             except Exception as e:
                 # 写入失败：恢复本次转移前的配额（先降后升），清理日志
                 self._apply_targets_decrease_first(current)
@@ -274,7 +278,15 @@ class TransferService:
 
         for g in sorted(self.group_paths, key=delta):
             if current[g] != targets[g]:
-                write_cpu_max(self.group_paths[g], targets[g])
+                self._write(g, targets[g])
+
+    def _write(self, group: str, cpu_max: CpuMax) -> None:
+        """写某一组 cpu.max，并登记写入窗口（起始于读配额之前）。"""
+        window = self.write_log.begin(group)
+        try:
+            write_cpu_max(self.group_paths[group], cpu_max)
+        finally:
+            self.write_log.end(window)
 
     def _record_result(self, result: dict) -> None:
         self.last_result = result

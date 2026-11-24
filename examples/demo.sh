@@ -4,6 +4,7 @@
 #   2) 重启后保留已登记成功的新配额
 #   3) 模拟“让出方降额后进程退出”→ 重启恢复、回退未登记成功的转移
 #   4) 下限校验（低于设定下限的划转被拒绝）
+#   5) 限速统计：编辑 cpu.stat 模拟计数增长，按配额档查询 /throttling
 #
 # 用法：
 #   examples/demo.sh docker   # 用 Docker Compose 启动（默认）
@@ -25,7 +26,29 @@ reset_files() {
   mkdir -p "$CGROUP_DIR/groupA" "$CGROUP_DIR/groupB" "$STATE_DIR"
   echo "100000 100000" > "$CGROUP_DIR/groupA/cpu.max"
   echo "50000 100000"  > "$CGROUP_DIR/groupB/cpu.max"
+  # 可修改的 cpu.stat 样例：后台每秒读取，累计限速周期
+  printf 'usage_usec 1250000\nnr_periods 1000\nnr_throttled 100\nthrottled_usec 4200000\n' \
+    > "$CGROUP_DIR/groupA/cpu.stat"
+  printf 'usage_usec 2500000\nnr_periods 1000\nnr_throttled 200\nthrottled_usec 8400000\n' \
+    > "$CGROUP_DIR/groupB/cpu.stat"
   rm -f "$STATE_DIR"/transfer_journal.json "$STATE_DIR"/last_result.json
+}
+
+bump_cpu_stat() {  # $1 group, $2 d_periods, $3 d_throttled
+  python3 - "$CGROUP_DIR/$1/cpu.stat" "$2" "$3" <<'PY'
+import sys
+p, dp, dt = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+vals = {}
+with open(p) as f:
+    for line in f:
+        k, v = line.split()
+        vals[k] = int(v)
+vals["nr_periods"] += dp
+vals["nr_throttled"] += dt
+with open(p, "w") as f:
+    for k, v in vals.items():
+        f.write(f"{k} {v}\n")
+PY
 }
 
 start_service() {  # $1 = CRASH_AFTER_DONOR_WRITE (0/1)
@@ -35,8 +58,11 @@ start_service() {  # $1 = CRASH_AFTER_DONOR_WRITE (0/1)
     ( cd "$ROOT" && \
       GROUP_A_CPU_MAX="$CGROUP_DIR/groupA/cpu.max" \
       GROUP_B_CPU_MAX="$CGROUP_DIR/groupB/cpu.max" \
+      GROUP_A_CPU_STAT="$CGROUP_DIR/groupA/cpu.stat" \
+      GROUP_B_CPU_STAT="$CGROUP_DIR/groupB/cpu.stat" \
       STATE_DIR="$STATE_DIR" \
       MIN_QUOTA=20000 \
+      CPU_STAT_SAMPLE_INTERVAL=1.0 \
       CRASH_AFTER_DONOR_WRITE="$1" \
       exec "$UVICORN" --factory app.main:app_factory --host 127.0.0.1 --port 8000 \
     ) >/tmp/quota-transfer.log 2>&1 &
@@ -131,5 +157,25 @@ curl -fsS "$BASE_URL/status"; echo
 say "5. 下限校验：groupB 当前 30000，下限 20000，让出 15000 将被拒绝"
 code=$(post_transfer groupB 15000); show "HTTP $code"; cat /tmp/transfer_resp.json; echo
 show_quotas
+
+# ---------------------------------------------------------------- 6. 限速统计
+say "6. 限速统计：编辑 cpu.stat 模拟计数增长，按配额档累计限速周期"
+show "累计前（先让后台完成一次基线采样）"
+sleep 1.5
+bump_cpu_stat groupA 100 30
+bump_cpu_stat groupB 200 20
+sleep 1.5
+show "groupA/cpu.stat -> $(tr '\n' ' ' < "$CGROUP_DIR/groupA/cpu.stat")"
+show "按组查询限速统计:"
+curl -fsS "$BASE_URL/throttling/groupA"; echo
+curl -fsS "$BASE_URL/throttling/groupB"; echo
+show "划转后本组采样窗口内有 cpu.max 写入，这段周期计入 unattributable:"
+sleep 1
+code=$(post_transfer groupB 10000); show "HTTP $code"
+bump_cpu_stat groupA 50 5
+bump_cpu_stat groupB 50 5
+sleep 1.5
+curl -fsS "$BASE_URL/throttling/groupA"; echo
+show "浏览器打开 $BASE_URL/docs 可直接调用 /throttling 接口"
 
 say "演示完成"
